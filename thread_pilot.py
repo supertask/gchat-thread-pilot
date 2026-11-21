@@ -218,3 +218,129 @@ def fetch_attachments(m, credentials, media_urls=None, media_types=None):
     except Exception:
         logger.warning('[GoogleChat] pilot attachment fetch failed', exc_info=True)
     return urls, types
+
+
+# Mainstream-style attachment pre-processing (2026-11-21, owner decision:
+# "みんながやってるやり方を参考に" — ChatGPT/OpenAI style = text layer + page
+# images passed directly to the vision model, no OCR engine in between).
+# Limits keep the turn cheap: a video turn once ran 21 min / 46 iterations
+# because the agent extracted frames itself; pre-extracting here bounds it.
+_PDF_TEXT_CAP = 3500
+_PDF_PAGES_WITH_TEXT = 2
+_PDF_PAGES_NO_TEXT = 4
+_PDF_ZOOM = 2.0
+_VIDEO_FRAMES = 3
+
+
+def prepare_attachment_media(paths, types):
+    """Best-effort mainstream pre-processing of downloaded attachments.
+
+    Returns ``(extra_paths, extra_types, extra_text, audio_paths)``:
+    - PDF  → extracted text layer (capped) + first pages rendered to PNG
+             (images ride the normal inline-vision routing);
+    - video→ evenly-spaced preview frames as PNG + an extracted WAV for the
+             caller's STT step;
+    - anything else / any failure → empty extras (never blocks the turn).
+    """
+    import logging
+    import pathlib
+    import subprocess
+    logger = logging.getLogger(__name__)
+    extra_paths, extra_types, audio_paths = [], [], []
+    texts = []
+    for path, mtype in zip(paths, types or []):
+        p = pathlib.Path(path)
+        if not p.is_file():
+            continue
+        mtype = mtype or ''
+        try:
+            if mtype == 'application/pdf' or p.suffix.lower() == '.pdf':
+                _prepare_pdf(p, extra_paths, extra_types, texts)
+            elif mtype.startswith('video/') or p.suffix.lower() == '.mp4':
+                _prepare_video(p, extra_paths, extra_types, audio_paths, texts)
+        except Exception:
+            logger.warning('[GoogleChat] pilot attachment pre-process failed: %s',
+                           p.name, exc_info=True)
+    text_block = ''
+    if texts:
+        text_block = ('[添付ファイルの前処理結果（テキスト層抽出）—— 推測で補わず'
+                      'この内容を踏まえて答えてください]\n' + '\n---\n'.join(texts))
+    return extra_paths, extra_types, text_block, audio_paths
+
+
+def _ffmpeg_bin(name):
+    import shutil
+    found = shutil.which(name)
+    return found or name
+
+
+def _prepare_pdf(p, extra_paths, extra_types, texts):
+    import pymupdf
+    doc = pymupdf.open(str(p))
+    text_parts = []
+    page_limit = min(doc.page_count, _PDF_PAGES_NO_TEXT)
+    try:
+        for i in range(min(doc.page_count, 8)):
+            t = (doc[i].get_text() or '').strip()
+            if t:
+                text_parts.append(t)
+        has_text = bool(' '.join(text_parts).strip())
+        limit = min(doc.page_count, _PDF_PAGES_WITH_TEXT if has_text else _PDF_PAGES_NO_TEXT)
+        page_limit = limit
+        for i in range(limit):
+            pix = doc[i].get_pixmap(matrix=pymupdf.Matrix(_PDF_ZOOM, _PDF_ZOOM))
+            out = p.with_name(f'{p.stem}_page{i + 1}.png')
+            pix.save(str(out))
+            extra_paths.append(str(out))
+            extra_types.append('image/png')
+        if text_parts:
+            joined = '\n\n'.join(text_parts).strip()
+            if len(joined) > _PDF_TEXT_CAP:
+                joined = joined[:_PDF_TEXT_CAP] + '…（以下省略）'
+            texts.append(f'{p.name}（テキスト層あり・{doc.page_count}ページ）:\n{joined}')
+        elif doc.page_count:
+            texts.append(f'{p.name}（テキスト層なし・{doc.page_count}ページ・ページ画像を同梱）')
+    finally:
+        doc.close()
+    _ = page_limit
+
+
+def _prepare_video(p, extra_paths, extra_types, audio_paths, texts):
+    import json
+    import subprocess
+    probe = subprocess.run(
+        [_ffmpeg_bin('ffprobe'), '-v', 'error', '-show_entries',
+         'format=duration:stream=codec_type', '-of', 'json', str(p)],
+        capture_output=True, timeout=30)
+    duration, has_audio = 0.0, False
+    if probe.returncode == 0 and probe.stdout:
+        info = json.loads(probe.stdout.decode('utf-8', 'replace') or '{}')
+        try:
+            duration = float((info.get('format') or {}).get('duration') or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        has_audio = any((s.get('codec_type') == 'audio')
+                        for s in info.get('streams') or [])
+    base = _ffmpeg_bin('ffmpeg')
+    count = _VIDEO_FRAMES if duration > 0 else 1
+    for i in range(count):
+        seek = max(0.0, min(duration * (i + 0.5) / count if duration > 0 else 0.0,
+                            max(0.0, duration - 0.5)))
+        out = p.with_name(f'{p.stem}_frame{i + 1}.png')
+        r = subprocess.run(
+            [base, '-y', '-ss', f'{seek:.2f}', '-i', str(p), '-frames:v', '1',
+             '-q:v', '3', str(out)],
+            capture_output=True, timeout=30)
+        if r.returncode == 0 and out.is_file():
+            extra_paths.append(str(out))
+            extra_types.append('image/png')
+    if has_audio:
+        wav = p.with_name(f'{p.stem}_audio.wav')
+        r = subprocess.run(
+            [base, '-y', '-i', str(p), '-vn', '-ac', '1', '-ar', '16000',
+             str(wav)],
+            capture_output=True, timeout=60)
+        if r.returncode == 0 and wav.is_file() and wav.stat().st_size > 0:
+            audio_paths.append(str(wav))
+    texts.append(f'{p.name}（動画・{duration:.1f}秒・プレビューフレーム{count}枚を同梱'
+                 + ('・音声トラックあり（文字起こしは別添付のaudio.wav）' if has_audio else '・音声なし') + '）')
