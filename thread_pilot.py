@@ -159,6 +159,39 @@ def answer(m, credentials):
         return extract(m, page)
 
 
+def _tmp_cleanup() -> None:
+    """Delete downloaded attachment files older than the TTL (default 7 days).
+
+    Owner decision 2026-11-22: attachments are consumed by the agent turn and
+    re-downloaded on demand (``path.exists()`` check below), so old files are
+    pure disk pressure. GCHAT_PILOT_TMP_TTL_HOURS overrides the default 168.
+    """
+    import logging
+    import pathlib
+    import tempfile
+    import time as _time
+    _logger = logging.getLogger(__name__)
+    try:
+        ttl_hours = float(os.environ.get("GCHAT_PILOT_TMP_TTL_HOURS", "168") or "168")
+    except ValueError:
+        ttl_hours = 168.0
+    if ttl_hours <= 0:
+        return
+    directory = pathlib.Path(tempfile.gettempdir()) / "gchat_pilot"
+    if not directory.is_dir():
+        return
+    cutoff = _time.time() - ttl_hours * 3600.0
+    try:
+        for path in directory.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
+    except OSError:
+        _logger.warning("[GoogleChat] pilot tmp cleanup failed", exc_info=True)
+
+
 def fetch_attachments(m, credentials, media_urls=None, media_types=None):
     """Best-effort download of the addressed thread's attachments.
 
@@ -182,6 +215,7 @@ def fetch_attachments(m, credentials, media_urls=None, media_types=None):
     urls = list(media_urls or [])
     types = list(media_types or [])
     try:
+        _tmp_cleanup()
         with AuthorizedSession(credentials.with_scopes(scopes)) as session:
             token = None
             seen_refs = set()
