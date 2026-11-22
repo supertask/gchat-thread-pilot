@@ -110,7 +110,10 @@ def extract(m, page):
         # Over the cap keep the NEWEST part; an old message quoted in the
         # trigger still arrives inline with the quote-reply's own text.
         text = '…（冒頭省略）\n' + text[-8000:]
-    return '同じスレッドの人間の投稿（原文抜粋）:\n' + text
+    return ('同じスレッドの人間の投稿（原文抜粋）:\n' + text
+            + '\n\n（表示メモ: Chatの返信はMarkdown対応。過去発言の一部を引用して答えるときは '
+              '`> 引用文` のブロック引用を1〜3行・必要なら発言者名付きで使ってよい。'
+              '使用は状況判断に任せる。全メッセージ単位の引用返信はAPIの quotedMessageMetadata で可能。）')
 
 
 def _identity(credentials) -> "str | None":
