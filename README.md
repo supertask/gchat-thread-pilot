@@ -49,6 +49,24 @@ GCHAT_PILOT_APP_SA=<bot-sa>@<project>.iam.gserviceaccount.com
 5. `integration.md` に従って gateway に統合（本体への変更は最小限）
 6. gateway 再起動
 
+## 追加改修: 引用返信の自動化（adapter patch）
+
+`thread_pilot.py` 単体では返信は通常の送信になります。人間のメンションに応答するときに
+返信へ自動で引用気泡（`quotedMessageMetadata`）を付けたい場合、本体の
+`plugins/platforms/google_chat/adapter.py` にパッチを当てます:
+
+```bash
+# hermes-agent の作業コピーで
+git apply patches/0001-quote-reply-automation-and-fallback.patch
+```
+
+内容:
+
+- 人間からのメンション受信時、トリガーメッセージの name/lastUpdateTime（未編集なら createTime）をスレッド単位で退避
+- そのターン内の実質的な返信（ステータスバブル `⏳/💭/💾/·` を除く messages.create）すべてに `quotedMessageMetadata` を自動付与。ターン終了で退避をクリア
+- 引用元が実在しない（削除済み・合成イベント）などで create が 400 になった場合、引用を外して1回だけ再送するフォールバック付き — 返信がエラーで落ちない
+- 注意: 引用先は Chat 上に実在するメッセージである必要があります（Pub/Sub 経由の合成メッセージは実体がないため引用できず、フォールバック経路に落ちます）
+
 ## テスト
 
 ```bash
