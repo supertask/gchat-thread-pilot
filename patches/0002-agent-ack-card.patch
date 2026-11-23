@@ -1,0 +1,253 @@
+diff --git a/plugins/platforms/google_chat/adapter.py b/plugins/platforms/google_chat/adapter.py
+index 0cecf5b3c7..20d4905f76 100644
+--- a/plugins/platforms/google_chat/adapter.py
++++ b/plugins/platforms/google_chat/adapter.py
+@@ -414,6 +414,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         self._user_chat_api_by_email: dict[str, Any] = {}
+         # chat_id → most-recent inbound sender email (drives per-user token lookup).
+         self._last_sender_by_chat: dict[str, str] = {}
++        # DWD-impersonated (subject) credentials, built in connect() only when
++        # config.extra['impersonate_user'] / GOOGLE_CHAT_IMPERSONATE_USER is set.
++        # None = plain app authentication (behaviour unchanged).
++        self._dwd_credentials: Optional[Any] = None
++        # Parsed google_chat.events.* config (events_sub.events_config()).
++        # None = Workspace Events disabled — inbound workspaceevents-format
++        # envelopes are dropped early, and no subscription API calls run.
++        self._events_cfg: Optional[dict[str, Any]] = None
+         self._dedup = MessageDeduplicator()
+         self._shutting_down = False
+         self._typing_messages: dict[str, str] = {}
+@@ -421,6 +429,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         # Last inbound thread per space: DMs get a NEW thread per top-level message but users
+         # see one conversation, so thread_id leaves the source (stable session key) and is cached here.
+         self._last_inbound_thread: dict[str, str] = {}
++        # Pilot quote-reply: the trigger message's name/lastUpdateTime is stashed
++        # per thread at inbound (pilot space, human mention only) and consumed by
++        # the NEXT messages.create in that thread → quotedMessageMetadata
++        # (quoteType=REPLY). One-shot, so proactive sends later stay unquoted.
++        self._pilot_quote_by_thread: dict[str, dict[str, Any]] = {}
++        # Agent ack card (agent_ack_card flag): per-chat wording decided at
++        # inbound (rule-based, no model) and consumed by send_typing; chats
++        # listed in _ack_skip_typing get no card for the current turn.
++        self._ack_by_chat: dict[str, str] = {}
++        self._ack_skip_typing: set[str] = set()
+         from hermes_constants import get_hermes_home as _get_hermes_home
+         self._thread_count_store = _ThreadCountStore(_get_hermes_home() / "google_chat_thread_counts.json")
+         # In-flight typing-card creates per chat_id: reserved BEFORE the API call so
+@@ -642,6 +660,51 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         except (ValueError, FileNotFoundError) as exc:
+             return self._connect_failed("[GoogleChat] Config validation failed: %s", exc, "config_invalid", retryable=False)
+         self._project_id, self._subscription_path, self._credentials = project_id, subscription_path, credentials
++
++        # --- DWD impersonation (optional, config-gated) --------------------
++        # Sign the SA JWT with sub = the delegated user, giving USER-identity
++        # tokens. Powers the thread-pilot history read
++        # (chat.messages.readonly) and Workspace Events subscription
++        # management. Never fatal: any failure here keeps the adapter on
++        # plain app authentication.
++        try:
++            from . import dwd as _dwd_helper
++            _subject = _dwd_helper.impersonate_user(self.config.extra)
++            if _subject:
++                self._dwd_credentials = _dwd_helper.build_dwd_credentials(
++                    credentials, _subject, _dwd_helper.DWD_SCOPES
++                )
++                logger.info("[GoogleChat] DWD impersonation enabled for the delegated user")
++        except Exception as exc:
++            logger.warning(
++                "[GoogleChat] DWD impersonation unavailable; continuing with app authentication: %s",
++                _redact_sensitive(str(exc)),
++            )
++            self._dwd_credentials = None
++
++        # --- Workspace Events subscriptions (optional, config-gated) -------
++        # events.enabled false/absent → events_config() returns None and NO
++        # subscription API call is made. Failure to create/refresh is
++        # non-fatal: the mention-driven Pub/Sub path keeps working, and
++        # events already streaming into the topic are still parsed below.
++        try:
++            from . import events_sub as _events_helper
++            self._events_cfg = _events_helper.events_config(self.config.extra)
++            if self._events_cfg:
++                await asyncio.to_thread(
++                    _events_helper.ensure_subscriptions,
++                    self._dwd_credentials or credentials,
++                    self._events_cfg,
++                )
++                logger.info(
++                    "[GoogleChat] Workspace Events subscriptions ensured for %d space(s)",
++                    len(self._events_cfg.get("spaces") or []),
++                )
++        except Exception as exc:
++            logger.warning(
++                "[GoogleChat] Workspace Events setup failed (mention-driven inbound unaffected): %s",
++                _redact_sensitive(str(exc)),
++            )
+         try:
+             self._chat_api = await asyncio.to_thread(
+                 lambda: build_service("chat", "v1", credentials=credentials, cache_discovery=False))
+@@ -751,6 +814,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         if msg_payload_wrapper:
+             msg = msg_payload_wrapper.get("message") or {}
+             return msg, msg_payload_wrapper.get("space") or msg.get("space") or {}, "workspace_addons"
++        # Format 4: Workspace Events API. Body = the changed Chat resource
++        # ({"message": {...}}); the ``ce-type`` attribute names the event type.
++        # MUST be checked before Format 2, whose own ``message``-dict detection
++        # would otherwise reject this body for lacking ``type``.
++        if (ce_type and ce_type.startswith("google.workspace.chat.message.v1.")
++                and isinstance(envelope.get("message"), dict)):
++            msg = envelope["message"]
++            return msg, msg.get("space") or envelope.get("space") or {}, "workspace_events"
+         if isinstance(envelope.get("message"), dict):
+             if envelope.get("type", "") != "MESSAGE":
+                 return None
+@@ -794,6 +865,15 @@ class GoogleChatAdapter(BasePlatformAdapter):
+                 )
+             return None
+         msg, space, _fmt = extracted
++        # Workspace Events intake filter: mention-less messages that don't
++        # match the configured trigger_pattern are dropped early (ack, no
++        # dispatch, no typing). Mentions always pass through.
++        if _fmt == "workspace_events" and not self._events_wants(msg):
++            logger.debug(
++                "[GoogleChat] Workspace Events message dropped by filter; space=%s",
++                (space.get("name") or "?"),
++            )
++            return None
+         # Self-filter: drop bot-sourced messages (own replies and other bots).
+         if (msg.get("sender") or {}).get("type") == "BOT":
+             return None
+@@ -810,6 +890,15 @@ class GoogleChatAdapter(BasePlatformAdapter):
+                 d["space"] = space
+         return msg_with_space, enriched_env
+ 
++    def _events_wants(self, msg: dict[str, Any]) -> bool:
++        """Workspace Events intake gate (events_sub.should_dispatch).
++
++        ``self._events_cfg`` is None unless ``events.enabled`` is set — in
++        which case nothing from the Workspace Events stream is dispatched.
++        """
++        from . import events_sub
++        return events_sub.should_dispatch(msg, self._events_cfg)
++
+     def _on_pubsub_message(self, message: Any) -> None:
+         """Pub/Sub callback — parse envelope and dispatch to the asyncio loop.
+         Runs in a SubscriberClient worker thread: never block, never raise (that
+@@ -907,9 +996,43 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         """Translate a Chat message to a MessageEvent and hand off.
+         ``/setup-files`` is intercepted BEFORE the agent sees it (bot-local OAuth flow)."""
+         try:
++            # K8-PLUS thread-read pilot: in the pilot space only mention-bearing
++            # posts reach the agent (attachment-free, text-only); ordinary posts
++            # are dropped without building an event or triggering typing.
++            from . import thread_pilot
++            space = envelope.get("space") or msg.get("space") or {}
++            if (self.config.extra.get("thread_read_pilot") is True
++                    and space.get("name") == thread_pilot.SPACE):
++                if not thread_pilot.eligible(msg):
++                    return
++                msg = dict(msg, attachment=[])  # Text-only pilot.
++                # Stash the trigger message for the reply's quotedMessageMetadata
++                # (pilot quote-reply). Unedited messages lack lastUpdateTime →
++                # createTime is accepted by the API (measured 2026-11-22).
++                _tq_name = msg.get("name")
++                if _tq_name:
++                    self._pilot_quote_by_thread[(msg.get("thread") or {}).get("name") or _tq_name] = {
++                        "name": _tq_name,
++                        "lastUpdateTime": msg.get("lastUpdateTime") or msg.get("createTime"),
++                        "quoteType": "REPLY",
++                    }
+             event = await self._build_message_event(msg, envelope)
+             if event is None:
+                 return
++            # Agent ack card (flag agent_ack_card): rule-based wording decided at
++            # inbound so the bubble lands instantly, before any model runs. All
++            # spaces (bot members only), humans only, no slash commands.
++            # Independent of the pilot branch above — either can exist alone.
++            from . import ack as _ack_mod
++            if _ack_mod.enabled(self.config.extra):
++                _chat_name = space.get("name") or ""
++                _bot_name = await self._resolve_bot_user_id()
++                if _chat_name and not msg.get("slashCommand") and _ack_mod.mentions_bot(msg, _bot_name):
++                    _ack = _ack_mod.card_text(msg)
++                    if _ack:
++                        self._ack_by_chat[_chat_name] = _ack
++                    else:
++                        self._ack_skip_typing.add(_chat_name)
+             text = (event.text or "").strip()
+             # The sender email (user_id_alt) is the per-user OAuth token key.
+             if text.startswith("/setup-files") and event.source is not None and await self._handle_setup_files_command(
+@@ -1284,10 +1407,41 @@ class GoogleChatAdapter(BasePlatformAdapter):
+     async def _create_message(self, chat_id: str, body: dict[str, Any]) -> SendResult:
+         """POST spaces/{space}/messages via REST (with retry), returning SendResult."""
+         kwargs = _create_kwargs(chat_id, body)
+-        resp = await self._call_with_retry(
+-            lambda: self._chat_api.spaces().messages().create(**kwargs).execute(http=self._new_authed_http()),
+-            op_name="messages.create",
+-        )
++        # K8-PLUS thread-read pilot: replies in the pilot space must stay in
++        # the pilot thread — no fallback to a new thread.
++        from . import thread_pilot
++        if chat_id == thread_pilot.SPACE and self.config.extra.get("thread_read_pilot") is True:
++            if not (body.get("thread") or {}).get("name"):
++                return SendResult(success=False, error="Pilot requires a thread")
++            kwargs["messageReplyOption"] = "REPLY_MESSAGE_OR_FAIL"
++            # Pilot quote-reply: every substantive (non-status) create in the thread
++            # after a human mention carries the trigger message as
++            # quotedMessageMetadata. NOT popped here — typing/progress bubbles and
++            # chunked replies are separate creates, and the one-shot pop made the
++            # typing card consume the quote (measured 2026-11-22: reply had no
++            # bubble). The stash is cleared per turn in on_processing_complete.
++            _qmeta = self._pilot_quote_by_thread.get((body.get("thread") or {}).get("name"))
++            _btext = str(body.get("text") or "")
++            if _qmeta and not _btext.startswith(("⏳", "💭", "💾", "·")):
++                kwargs["body"]["quotedMessageMetadata"] = _qmeta
++        resp = None
++        try:
++            resp = await self._call_with_retry(
++                lambda: self._chat_api.spaces().messages().create(**kwargs).execute(http=self._new_authed_http()),
++                op_name="messages.create",
++            )
++        except HttpError as exc:
++            # Quote fallback: a bad quote target (e.g. quoted message deleted, or a
++            # synthetic/missing trigger) must not kill the whole reply — retry once
++            # without quotedMessageMetadata.
++            if _http_status(exc) == 400 and kwargs.get("body", {}).pop("quotedMessageMetadata", None) is not None:
++                logger.info("[GoogleChat] quoted create rejected (400); retrying without the quote")
++                resp = await self._call_with_retry(
++                    lambda: self._chat_api.spaces().messages().create(**kwargs).execute(http=self._new_authed_http()),
++                    op_name="messages.create",
++                )
++            else:
++                raise
+         self._track_outbound_thread(chat_id, resp)
+         return SendResult(success=True, message_id=resp.get("name"))
+ 
+@@ -1307,7 +1461,12 @@ class GoogleChatAdapter(BasePlatformAdapter):
+                 await asyncio.wait_for(self._typing_card_inflight[chat_id].wait(), timeout=5.0)
+             return
+         thread_id = self._resolve_thread_id(reply_to=None, metadata=metadata, chat_id=chat_id)
+-        body = _thread_body(getattr(self.config, "typing_status_text", None) or t("platform.google_chat.typing.thinking"), thread_id)
++        # Agent ack card: this turn's card uses the rule-based ack wording
++        # (or no card at all for thanks/report-only mentions). Consumed once.
++        _ack_text = self._ack_by_chat.pop(chat_id, None)
++        if _ack_text is None and chat_id in self._ack_skip_typing:
++            return
++        body = _thread_body(_ack_text or getattr(self.config, "typing_status_text", None) or t("platform.google_chat.typing.thinking"), thread_id)
+         self._typing_card_inflight[chat_id] = completed = asyncio.Event()
+ 
+         async def _create_and_record() -> None:
+@@ -1357,6 +1516,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
+                 await self._patch_quietly(current, label, "[GoogleChat] on_processing_complete patch fallback failed")
+             for orphan_id in self._orphan_typing_messages.pop(chat_id, []):
+                 await self._patch_quietly(orphan_id, "·", "[GoogleChat] orphan typing-card patch failed: %s", orphan_id)
++            # Pilot quote-reply stash lives for exactly one turn: any leftover
++            # entry for this space is dropped so the next turn quotes its own
++            # trigger message (or none).
++            for _tkey in [k for k in self._pilot_quote_by_thread if k.startswith(chat_id)]:
++                self._pilot_quote_by_thread.pop(_tkey, None)
++            # Ack-card skip is per-turn: re-enable typing cards next turn.
++            self._ack_skip_typing.discard(chat_id)
+         except Exception:
+             logger.debug("[GoogleChat] cleanup in on_processing_complete failed", exc_info=True)
+ 
